@@ -144,7 +144,9 @@ def construire_plan(jour, zip_bytes):
     # 1) gares
     recherches = {e[k] for t in TRAJETS.values() for e in t["etapes"] for k in ("depart", "arrivee")}
     gares = {r: {} for r in recherches}  # recherche -> {stop_id: nom}
+    noms_arrets = {}
     for s in lire_csv(z, "stops.txt"):
+        noms_arrets[s["stop_id"]] = s["stop_name"]
         for r in recherches:
             if meme_nom(s["stop_name"], r):
                 gares[r][s["stop_id"]] = s["stop_name"]
@@ -173,7 +175,12 @@ def construire_plan(jour, zip_bytes):
     # 3) passages aux gares qui nous intéressent
     tous_ids = {sid for ids in gares.values() for sid in ids}
     passages = {}  # trip_id -> liste de (sequence, stop_id, arrivee, depart)
+    terminus = {}  # trip_id -> (sequence, stop_id) du dernier arrêt
     for st in lire_csv(z, "stop_times.txt"):
+        if st["trip_id"] in trips:
+            q = int(st["stop_sequence"])
+            if q > terminus.get(st["trip_id"], (-1, ""))[0]:
+                terminus[st["trip_id"]] = (q, st["stop_id"])
         if st["stop_id"] in tous_ids and st["trip_id"] in trips:
             passages.setdefault(st["trip_id"], []).append(
                 (int(st["stop_sequence"]), st["stop_id"], st["arrival_time"], st["departure_time"]))
@@ -218,18 +225,20 @@ def construire_plan(jour, zip_bytes):
         if len({a[2] for a in arrets}) >= 2:
             t = trips[trip_id]
             trains[trip_id] = {"numero": t.get("trip_headsign") or t.get("trip_short_name") or "",
-                               "arrets": arrets}
+                               "arrets": arrets,
+                               "terminus": court(noms_arrets.get(terminus.get(trip_id, (0, ""))[1], ""))}
     print(f"{len(trains)} trains du jour desservent ces gares")
     return plan, trains
 
 
 def obtenir_plan(jour, state):
     if state.get("plan", {}).get("jour") == jour.isoformat() and \
-            state["plan"].get("config") == TRAJETS and "trains" in state["plan"]:
+            state["plan"].get("config") == TRAJETS and state["plan"].get("version") == 3:
         return state["plan"]["etapes"], state["plan"]["trains"]
     print("Téléchargement des horaires SNCF du jour…")
     etapes, trains = construire_plan(jour, telecharger(GTFS_URL, timeout=300))
-    state["plan"] = {"jour": jour.isoformat(), "config": TRAJETS, "etapes": etapes, "trains": trains}
+    state["plan"] = {"jour": jour.isoformat(), "config": TRAJETS, "etapes": etapes, "trains": trains,
+                     "version": 3}
     return etapes, trains
 
 
@@ -568,7 +577,9 @@ def tableau_departs(spec, now):
         for x in suite:
             h = temps_reel_arret(tu, x, jour, "arr") if etat.startswith(("✅", "⚠️")) else None
             arrivees.append(f"{x[2]} {hhmm(h or gtfs_heure(jour, x[3]))}")
-        lignes.append((prevu, f"{hhmm(prevu)} train {t['numero']} — {etat} — arrivée " + ", ".join(arrivees)))
+        term = t.get("terminus") or "?"
+        lignes.append((prevu, f"{hhmm(prevu)} train {t['numero']} → terminus {term} — {etat} — passe à "
+                       + ", ".join(arrivees)))
     lignes.sort()
     print(f"Départs de {de} vers {', '.join(vers)} (aujourd'hui, {len(lignes)} trains) :")
     for _, l in lignes:
