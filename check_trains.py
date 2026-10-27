@@ -59,6 +59,22 @@ TEST = os.environ.get("TEST") == "1"
 
 
 # ---------- outils ----------
+import builtins
+JOURNAL = []
+_print = builtins.print
+
+
+def print(*a, **k):
+    JOURNAL.append(" ".join(str(x) for x in a))
+    _print(*a, **k)
+
+
+def publier_journal():
+    if os.environ.get("GITHUB_ACTIONS") and JOURNAL:
+        txt = "%0A".join(l.replace("%", "%25").replace("\n", "%0A") for l in JOURNAL)
+        _print(f"::notice title=Journal::{txt}")
+
+
 def norm(s):
     s = unicodedata.normalize("NFD", (s or "").lower())
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
@@ -412,7 +428,7 @@ def main():
             depart = heure(jour, etapes[0]["heure"])
             if (CONFIRMER_A_L_HEURE and cle not in notifs and cle + ":ok" not in notifs
                     and now >= depart - timedelta(minutes=CONFIRMATION_AVANT_MIN)):
-                notifier(f"🚆 {nom} : tout est à l'heure", texte, 2, ["white_check_mark", "train"])
+                notifier(f"🚆 {nom} : tout est à l'heure", texte, 3, ["white_check_mark", "train"])
                 notifs[cle + ":ok"] = True
             else:
                 print("Rien de nouveau depuis la dernière notification.")
@@ -443,4 +459,6 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print("Erreur :", repr(e), file=sys.stderr)
+        publier_journal()
         sys.exit(1)
+    publier_journal()
