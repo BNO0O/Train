@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""
+Surveille mes trains SNCF et envoie une notification sur l'iPhone (via ntfy)
+en cas de retard, de suppression ou de correspondance menacée.
+
+Données : flux ouverts de la SNCF publiés sur transport.data.gouv.fr
+(aucune clé, aucune inscription) :
+  - horaires théoriques (GTFS), téléchargés une fois par jour
+  - temps réel (GTFS-RT) : retards, suppressions, messages d'alerte
+
+Variables d'environnement :
+  NTFY_TOPIC  nom du sujet ntfy auquel l'iPhone est abonné
+  TEST=1      ignore les horaires et envoie toujours un résumé (pour tester)
+"""
+import csv
+import io
+import json
+import os
+import sys
+import unicodedata
+import urllib.request
+import zipfile
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+# --------------------------------------------------------------------------
+# CONFIGURATION — c'est ici qu'on modifie ses horaires
+# --------------------------------------------------------------------------
+TRAJETS = {
+    "Aller": {
+        "jours": [0, 1, 2, 3, 4],  # 0 = lundi ... 4 = vendredi
+        "etapes": [
+            {"depart": "Orry-la-Ville", "arrivee": "Creil", "heure": "07:40"},
+            {"depart": "Creil", "arrivee": "Compiègne", "heure": "08:04"},
+        ],
+    },
+    "Retour": {
+        "jours": [0, 1, 2, 3, 4],
+        "etapes": [
+            {"depart": "Compiègne", "arrivee": "Orry-la-Ville", "heure": "17:11"},
+        ],
+    },
+}
+
+SURVEILLANCE_AVANT_MIN = 60   # on commence à surveiller 1 h avant le 1er train
+SEUIL_RETARD_MIN = 3          # en dessous, on considère le train à l'heure
+MARGE_CORRESPONDANCE_MIN = 2  # temps minimum pour changer de quai à Creil
+# --------------------------------------------------------------------------
+
+GTFS_URL = "https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip"
+RT_TRIPS_URL = "https://proxy.transport.data.gouv.fr/resource/sncf-gtfs-rt-trip-updates"
+RT_ALERTS_URL = "https://proxy.transport.data.gouv.fr/resource/sncf-gtfs-rt-service-alerts"
+
+TZ = ZoneInfo("Europe/Paris")
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")
+TEST = os.environ.get("TEST") == "1"
+
+
+# ---------- outils ----------
+def norm(s):
+    s = unicodedata.normalize("NFD", (s or "").lower())
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return "".join(c if c.isalnum() else " " for c in s).split()
+
+
+def meme_nom(nom_gare, recherche):
+    """« Orry-la-Ville » correspond à « Orry-la-Ville-Coye », mais « Creil » pas à « Creil Sud »… sauf si rien d'autre."""
+    a, b = norm(nom_gare), norm(recherche)
+    return a[:len(b)] == b
+
+
+def telecharger(url, timeout=120):
+    req = urllib.request.Request(url, headers={"User-Agent": "alertes-trains/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def heure(jour, hh_mm):
+    h, m = map(int, hh_mm.split(":"))
+    return datetime.combine(jour, time(h, m), TZ)
+
+
+def gtfs_heure(jour, s):
+    """Heure GTFS (peut dépasser 24:00) → datetime."""
+    h, m, sec = map(int, s.split(":"))
+    return datetime.combine(jour, time(0), TZ) + timedelta(hours=h, minutes=m, seconds=sec)
+
+
+def hhmm(d):
+    return d.strftime("%H:%M")
+
+
+def court(nom):
+    return nom.split(" - ")[0]
+
+
+# ---------- état (mémoire entre deux exécutions) ----------
+def charger_etat():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def sauver_etat(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+
+
+# ---------- horaires théoriques ----------
+def lire_csv(z, nom):
+    with z.open(nom) as f:
+        yield from csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
+
+
+def construire_plan(jour, zip_bytes):
+    """Trouve, dans le GTFS, le train correspondant à chaque étape configurée pour ce jour."""
+    z = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    noms_fichiers = set(z.namelist())
+
+    # 1) gares
+    recherches = {e[k] for t in TRAJETS.values() for e in t["etapes"] for k in ("depart", "arrivee")}
+    gares = {r: {} for r in recherches}  # recherche -> {stop_id: nom}
+    for s in lire_csv(z, "stops.txt"):
+        for r in recherches:
+            if meme_nom(s["stop_name"], r):
+                gares[r][s["stop_id"]] = s["stop_name"]
+    for r, ids in gares.items():
+        noms = sorted(set(ids.values()))
+        print(f"Gare « {r} » → {', '.join(noms) or 'INTROUVABLE'}")
+
+    # 2) services circulant ce jour-là
+    services = set()
+    ymd, jour_sem = jour.strftime("%Y%m%d"), jour.weekday()
+    cols = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    if "calendar.txt" in noms_fichiers:
+        for c in lire_csv(z, "calendar.txt"):
+            if c["start_date"] <= ymd <= c["end_date"] and c[cols[jour_sem]] == "1":
+                services.add(c["service_id"])
+    if "calendar_dates.txt" in noms_fichiers:
+        for c in lire_csv(z, "calendar_dates.txt"):
+            if c["date"] == ymd:
+                (services.add if c["exception_type"] == "1" else services.discard)(c["service_id"])
+
+    trips = {}
+    for t in lire_csv(z, "trips.txt"):
+        if t["service_id"] in services:
+            trips[t["trip_id"]] = t
+
+    # 3) passages aux gares qui nous intéressent
+    tous_ids = {sid for ids in gares.values() for sid in ids}
+    passages = {}  # trip_id -> liste de (sequence, stop_id, arrivee, depart)
+    for st in lire_csv(z, "stop_times.txt"):
+        if st["stop_id"] in tous_ids and st["trip_id"] in trips:
+            passages.setdefault(st["trip_id"], []).append(
+                (int(st["stop_sequence"]), st["stop_id"], st["arrival_time"], st["departure_time"]))
+
+    # 4) pour chaque étape, le train qui part à la bonne heure et dessert l'arrivée ensuite
+    plan = {}
+    for nom, trajet in TRAJETS.items():
+        for i, e in enumerate(trajet["etapes"]):
+            cle = f"{nom}:{i}"
+            o_ids, d_ids = gares[e["depart"]], gares[e["arrivee"]]
+            trouve = None
+            for trip_id, ps in passages.items():
+                ps.sort()
+                for po in ps:
+                    if po[1] in o_ids and po[3][:5].zfill(5) == e["heure"].zfill(5):
+                        pd = next((p for p in ps if p[0] > po[0] and p[1] in d_ids), None)
+                        if pd:
+                            t = trips[trip_id]
+                            trouve = {
+                                "trip_id": trip_id,
+                                "numero": t.get("trip_headsign") or t.get("trip_short_name") or "",
+                                "depart_stop": po[1], "depart_seq": po[0], "depart": po[3],
+                                "arrivee_stop": pd[1], "arrivee_seq": pd[0], "arrivee": pd[2],
+                                "gare_depart": court(o_ids[po[1]]), "gare_arrivee": court(d_ids[pd[1]]),
+                            }
+                            break
+                if trouve:
+                    break
+            plan[cle] = trouve
+            print(f"{nom} {e['heure']} {e['depart']} → {e['arrivee']} : "
+                  + (f"train {trouve['numero']} ({trouve['trip_id']})" if trouve else "NON TROUVÉ"))
+    return plan
+
+
+def obtenir_plan(jour, state):
+    if state.get("plan", {}).get("jour") == jour.isoformat() and \
+            state["plan"].get("config") == TRAJETS:
+        return state["plan"]["etapes"]
+    print("Téléchargement des horaires SNCF du jour…")
+    etapes = construire_plan(jour, telecharger(GTFS_URL, timeout=300))
+    state["plan"] = {"jour": jour.isoformat(), "config": TRAJETS, "etapes": etapes}
+    return etapes
+
+
+# ---------- temps réel ----------
+def charger_temps_reel():
+    from google.transit import gtfs_realtime_pb2
+
+    maj = {}
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(telecharger(RT_TRIPS_URL, timeout=60))
+    for ent in feed.entity:
+        if ent.HasField("trip_update"):
+            maj[ent.trip_update.trip.trip_id] = ent.trip_update
+
+    alertes = {}
+    try:
+        feed = gtfs_realtime_pb2.FeedMessage()
+        feed.ParseFromString(telecharger(RT_ALERTS_URL, timeout=60))
+        for ent in feed.entity:
+            if not ent.HasField("alert"):
+                continue
+            a = ent.alert
+            txt = ""
+            for champ in (a.header_text, a.description_text):
+                for tr in champ.translation:
+                    if tr.text and (not tr.language or tr.language.startswith("fr")):
+                        txt = (txt + " — " if txt else "") + tr.text.strip()
+                        break
+            for ie in a.informed_entity:
+                if ie.trip.trip_id and txt:
+                    alertes.setdefault(ie.trip.trip_id, txt[:220])
+    except Exception as ex:
+        print("Alertes indisponibles :", repr(ex))
+    return maj, alertes
+
+
+def stu_pour(tu, stop_id, seq):
+    for s in tu.stop_time_update:
+        if (s.stop_id and s.stop_id == stop_id) or (s.HasField("stop_sequence") and s.stop_sequence == seq):
+            return s
+    return None
+
+
+def heure_reelle(prevue, ev):
+    """ev : StopTimeEvent GTFS-RT (time absolu ou delay)."""
+    if ev is None:
+        return prevue
+    if ev.time:
+        return datetime.fromtimestamp(ev.time, TZ)
+    if ev.HasField("delay"):
+        return prevue + timedelta(seconds=ev.delay)
+    return prevue
+
+
+def analyser_etape(e, info, jour, maj, alertes):
+    from google.transit import gtfs_realtime_pb2
+    SR_TRIP = gtfs_realtime_pb2.TripDescriptor
+    SR_STOP = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate
+
+    r = {"libelle": f"{e['heure']} {e['depart']} → {e['arrivee']}", "gare_arrivee": e["arrivee"],
+         "retard": 0, "message": ""}
+    if not info:
+        r["etat"] = "non_suivi"
+        return r
+
+    r["numero"] = info["numero"]
+    r["gare_arrivee"] = info["gare_arrivee"]
+    dep_prevu = gtfs_heure(jour, info["depart"])
+    arr_prevue = gtfs_heure(jour, info["arrivee"])
+    r["message"] = alertes.get(info["trip_id"], "")
+
+    tu = maj.get(info["trip_id"])
+    if tu is None:  # pas de mise à jour temps réel = circule comme prévu
+        r.update(etat="ok", depart_reel=dep_prevu, arrivee_estimee=arr_prevue)
+        return r
+
+    if tu.trip.schedule_relationship == SR_TRIP.CANCELED:
+        r["etat"] = "supprime"
+        return r
+
+    so = stu_pour(tu, info["depart_stop"], info["depart_seq"])
+    sd = stu_pour(tu, info["arrivee_stop"], info["arrivee_seq"])
+    if so is not None and so.schedule_relationship == SR_STOP.SKIPPED:
+        r["etat"] = "supprime"
+        return r
+
+    dep_reel = heure_reelle(dep_prevu, so.departure if so is not None and so.HasField("departure") else
+                            (so.arrival if so is not None and so.HasField("arrival") else None))
+    # Si la gare de départ n'est pas listée, on prend le dernier retard connu avant elle
+    if so is None:
+        avant = [s for s in tu.stop_time_update if s.HasField("stop_sequence") and s.stop_sequence < info["depart_seq"]]
+        if avant:
+            ev = avant[-1].departure if avant[-1].HasField("departure") else avant[-1].arrival
+            if ev.HasField("delay"):
+                dep_reel = dep_prevu + timedelta(seconds=ev.delay)
+
+    retard = max(0, round((dep_reel - dep_prevu).total_seconds() / 60))
+    if sd is not None and sd.HasField("arrival"):
+        arr_est = heure_reelle(arr_prevue, sd.arrival)
+    else:
+        arr_est = arr_prevue + timedelta(minutes=retard)
+
+    r.update(retard=retard, depart_reel=dep_reel, arrivee_estimee=arr_est)
+    if sd is not None and sd.schedule_relationship == SR_STOP.SKIPPED:
+        r["etat"] = "modifie"
+    elif retard >= SEUIL_RETARD_MIN:
+        r["etat"] = "retard"
+    else:
+        r["etat"] = "ok"
+    return r
+
+
+# ---------- message ----------
+def ligne(r):
+    num = f" (train {r['numero']})" if r.get("numero") else ""
+    e = r["etat"]
+    if e == "ok":
+        txt = f"✅ {r['libelle']} : à l'heure{num}"
+    elif e == "retard":
+        txt = f"⚠️ {r['libelle']} : +{r['retard']} min, départ {hhmm(r['depart_reel'])}{num}"
+    elif e == "supprime":
+        txt = f"❌ {r['libelle']} : SUPPRIMÉ{num}"
+    elif e == "modifie":
+        txt = f"⚠️ {r['libelle']} : ne s'arrête plus à {r['gare_arrivee']}{num}"
+    else:
+        return f"❓ {r['libelle']} : absent des données SNCF du jour (non surveillé)"
+    if r["message"] and e != "ok":
+        txt += f"\n   ↳ {r['message']}"
+    return txt
+
+
+def correspondances(resultats):
+    out = []
+    for a, b in zip(resultats, resultats[1:]):
+        menacee = (a["etat"] in ("ok", "retard") and b["etat"] in ("ok", "retard")
+                   and a["arrivee_estimee"] + timedelta(minutes=MARGE_CORRESPONDANCE_MIN) > b["depart_reel"])
+        out.append({"menacee": menacee,
+                    "texte": (f"🔁 Correspondance à {a['gare_arrivee']} menacée : arrivée estimée "
+                              f"{hhmm(a['arrivee_estimee'])}, départ {hhmm(b['depart_reel'])}")
+                    if menacee else ""})
+    return out
+
+
+def signature(resultats, corresp):
+    return {"etapes": [{"etat": r["etat"], "retard": r["retard"]} for r in resultats],
+            "corresp": [c["menacee"] for c in corresp]}
+
+
+def changement_significatif(avant, apres):
+    if avant is None:
+        avant = {"etapes": [{"etat": "ok", "retard": 0}] * len(apres["etapes"]),
+                 "corresp": [False] * len(apres["corresp"])}
+    if avant["corresp"] != apres["corresp"]:
+        return True
+    for a, b in zip(avant["etapes"], apres["etapes"]):
+        ea = "ok" if a["etat"] == "non_suivi" else a["etat"]
+        eb = "ok" if b["etat"] == "non_suivi" else b["etat"]
+        if ea != eb:
+            return True
+        if eb == "retard" and abs(a["retard"] - b["retard"]) >= SEUIL_RETARD_MIN:
+            return True
+    return False
+
+
+def notifier(titre, texte, priorite, tags):
+    body = json.dumps({"topic": os.environ["NTFY_TOPIC"], "title": titre, "message": texte,
+                       "priority": priorite, "tags": tags}).encode()
+    req = urllib.request.Request(os.environ.get("NTFY_SERVER", "https://ntfy.sh"), data=body,
+                                 headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=20).read()
+    print("Notification envoyée :", titre)
+
+
+# ---------- programme principal ----------
+def main():
+    now = datetime.now(TZ)
+    jour = now.date()
+    state = charger_etat()
+    notifs = state.setdefault("notifie", {})
+    for k in [k for k in notifs if not k.startswith(jour.isoformat())]:
+        del notifs[k]
+
+    a_surveiller = []
+    for nom, trajet in TRAJETS.items():
+        etapes = trajet["etapes"]
+        debut = heure(jour, etapes[0]["heure"]) - timedelta(minutes=SURVEILLANCE_AVANT_MIN)
+        fin = heure(jour, etapes[-1]["heure"]) + timedelta(minutes=2)
+        if TEST or (now.weekday() in trajet["jours"] and debut <= now <= fin):
+            a_surveiller.append(nom)
+        else:
+            print(f"{nom} : hors de la fenêtre de surveillance ({hhmm(debut)}–{hhmm(fin)})")
+    if not a_surveiller:
+        sauver_etat(state)
+        return
+
+    plan = obtenir_plan(jour, state)
+    maj, alertes = charger_temps_reel()
+    print(f"Temps réel : {len(maj)} trains avec mise à jour, {len(alertes)} alertes")
+
+    for nom in a_surveiller:
+        etapes = TRAJETS[nom]["etapes"]
+        resultats = [analyser_etape(e, plan.get(f"{nom}:{i}"), jour, maj, alertes)
+                     for i, e in enumerate(etapes)]
+        corresp = correspondances(resultats)
+        texte = "\n".join([ligne(r) for r in resultats] + [c["texte"] for c in corresp if c["texte"]])
+        print(texte)
+
+        if TEST:
+            notifier(f"🧪 Test – {nom}", texte, 3, ["train"])
+            continue
+
+        cle = f"{jour.isoformat()}:{nom}"
+        sig = signature(resultats, corresp)
+        if not changement_significatif(notifs.get(cle), sig):
+            print("Rien de nouveau depuis la dernière notification.")
+            continue
+
+        if any(r["etat"] == "supprime" for r in resultats):
+            quoi, prio = "train supprimé", 5
+        elif any(r["etat"] == "modifie" for r in resultats):
+            quoi, prio = "train modifié", 5
+        elif any(c["menacee"] for c in corresp):
+            quoi, prio = "correspondance menacée", 5
+        elif any(r["etat"] == "retard" for r in resultats):
+            quoi, prio = "retard", 4
+        else:
+            quoi, prio = None, 3
+
+        if quoi:
+            notifier(f"🚆 {nom} : {quoi}", texte, prio, ["warning", "train"])
+        else:
+            notifier(f"🚆 {nom} : retour à la normale", texte, prio, ["white_check_mark", "train"])
+        notifs[cle] = sig
+
+    sauver_etat(state)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print("Erreur :", repr(e), file=sys.stderr)
+        sys.exit(1)

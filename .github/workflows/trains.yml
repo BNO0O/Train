@@ -1,0 +1,52 @@
+name: Surveillance trains
+
+on:
+  schedule:
+    # Toutes les 5 min, du lundi au vendredi (heures en UTC).
+    # Couvre l'heure d'hiver et d'été ; le script filtre lui-même la bonne fenêtre.
+    - cron: "*/5 4-7 * * 1-5"    # aller (7h40)
+    - cron: "*/5 14-16 * * 1-5"  # retour (17h11)
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Envoyer une notification de test"
+        type: boolean
+        default: true
+
+concurrency:
+  group: trains
+  cancel-in-progress: false
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Récupérer la mémoire des notifications
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: etat-${{ github.run_id }}
+          restore-keys: etat-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer la bibliothèque temps réel
+        run: pip install gtfs-realtime-bindings
+
+      - name: Vérifier les trains
+        run: python check_trains.py
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test && '1' || '' }}
+
+      - name: Sauver la mémoire des notifications
+        if: always() && hashFiles('state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: etat-${{ github.run_id }}
