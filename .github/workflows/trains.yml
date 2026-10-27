@@ -2,7 +2,7 @@ name: Surveillance trains
 
 on:
   schedule:
-    # Toutes les 5 min, du lundi au vendredi (heures en UTC).
+    # Toutes les 5 min, du lundi au vendredi.
     # Couvre l'heure d'hiver et d'été ; le script filtre lui-même la bonne fenêtre.
     - cron: "*/5 4-7 * * 1-5"    # aller (7h40)
     - cron: "*/5 14-16 * * 1-5"  # retour (17h11)
