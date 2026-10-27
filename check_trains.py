@@ -45,6 +45,8 @@ TRAJETS = {
 SURVEILLANCE_AVANT_MIN = 60   # on commence à surveiller 1 h avant le 1er train
 SEUIL_RETARD_MIN = 3          # en dessous, on considère le train à l'heure
 SEUIL_CHANGEMENT_MIN = 1      # nouvelle alerte dès que l'heure de départ bouge d'au moins 1 min
+ALTERNATIVES = True           # en cas de problème, cherche un trajet plus rapide
+GAIN_MIN_ALTERNATIVE = 3      # … proposé seulement s'il fait arriver au moins 3 min plus tôt
 PROLONGATION_MAX_MIN = 120    # si retard, on surveille jusqu'au départ réel (au plus 2 h de plus)
 MARGE_CORRESPONDANCE_MIN = 2  # temps minimum pour changer de quai à Creil
 CONFIRMER_A_L_HEURE = True    # période d'essai : notifie aussi quand tout est à l'heure (False pour arrêter)
@@ -203,17 +205,32 @@ def construire_plan(jour, zip_bytes):
             plan[cle] = trouve
             print(f"{nom} {e['heure']} {e['depart']} → {e['arrivee']} : "
                   + (f"train {trouve['numero']} ({trouve['trip_id']})" if trouve else "NON TROUVÉ"))
-    return plan
+
+    # 5) tous les trains du jour qui desservent au moins deux de nos gares (pour les alternatives)
+    gare_de = {}
+    for r, ids in gares.items():
+        for sid in ids:
+            gare_de.setdefault(sid, r)
+    trains = {}
+    for trip_id, ps in passages.items():
+        ps.sort()
+        arrets = [[seq, sid, gare_de[sid], arr, dep] for seq, sid, arr, dep in ps]
+        if len({a[2] for a in arrets}) >= 2:
+            t = trips[trip_id]
+            trains[trip_id] = {"numero": t.get("trip_headsign") or t.get("trip_short_name") or "",
+                               "arrets": arrets}
+    print(f"{len(trains)} trains du jour desservent ces gares")
+    return plan, trains
 
 
 def obtenir_plan(jour, state):
     if state.get("plan", {}).get("jour") == jour.isoformat() and \
-            state["plan"].get("config") == TRAJETS:
-        return state["plan"]["etapes"]
+            state["plan"].get("config") == TRAJETS and "trains" in state["plan"]:
+        return state["plan"]["etapes"], state["plan"]["trains"]
     print("Téléchargement des horaires SNCF du jour…")
-    etapes = construire_plan(jour, telecharger(GTFS_URL, timeout=300))
-    state["plan"] = {"jour": jour.isoformat(), "config": TRAJETS, "etapes": etapes}
-    return etapes
+    etapes, trains = construire_plan(jour, telecharger(GTFS_URL, timeout=300))
+    state["plan"] = {"jour": jour.isoformat(), "config": TRAJETS, "etapes": etapes, "trains": trains}
+    return etapes, trains
 
 
 # ---------- temps réel ----------
@@ -325,6 +342,133 @@ def analyser_etape(e, info, jour, maj, alertes):
     return r
 
 
+# ---------- alternatives ----------
+def temps_reel_arret(tu, arret, jour, quoi):
+    """Heure réelle de passage (quoi = 'arr' ou 'dep') ; None si l'arrêt est supprimé."""
+    from google.transit import gtfs_realtime_pb2
+    SKIPPED = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
+    seq, sid, _, arr, dep = arret
+    prevue = gtfs_heure(jour, arr if quoi == "arr" else dep)
+    if tu is None:
+        return prevue
+    s = stu_pour(tu, sid, seq)
+    if s is not None:
+        if s.schedule_relationship == SKIPPED:
+            return None
+        champs = ("arrival", "departure") if quoi == "arr" else ("departure", "arrival")
+        for c in champs:
+            if s.HasField(c):
+                return heure_reelle(prevue, getattr(s, c))
+        return prevue
+    # arrêt non listé : on reprend le dernier retard connu avant lui
+    avant = [x for x in tu.stop_time_update if x.HasField("stop_sequence") and x.stop_sequence < seq]
+    if avant:
+        x = avant[-1]
+        ev = x.departure if x.HasField("departure") else x.arrival
+        if ev.HasField("delay"):
+            return prevue + timedelta(seconds=ev.delay)
+    return prevue
+
+
+def troncons(trains, maj, jour, de, vers, apres):
+    """Tous les trains réels de « de » vers « vers » partant à partir de « apres »."""
+    from google.transit import gtfs_realtime_pb2
+    CANCELED = gtfs_realtime_pb2.TripDescriptor.CANCELED
+    out = []
+    for trip_id, t in trains.items():
+        tu = maj.get(trip_id)
+        if tu is not None and tu.trip.schedule_relationship == CANCELED:
+            continue
+        a = t["arrets"]
+        for i, ao in enumerate(a):
+            if ao[2] != de:
+                continue
+            ad = next((x for x in a[i + 1:] if x[2] == vers), None)
+            if not ad:
+                continue
+            dep = temps_reel_arret(tu, ao, jour, "dep")
+            arr = temps_reel_arret(tu, ad, jour, "arr")
+            if dep and arr and dep >= apres:
+                out.append({"trip_id": trip_id, "numero": t["numero"], "de": de, "vers": vers,
+                            "dep": dep, "arr": arr, "dep_prevu": gtfs_heure(jour, ao[4])})
+            break
+    return out
+
+
+def meilleur_trajet(trains, maj, jour, de, vers, apres, gares_possibles):
+    """Arrivée la plus tôt : direct ou avec un changement dans une de nos gares."""
+    marge = timedelta(minutes=MARGE_CORRESPONDANCE_MIN)
+    options = [[t] for t in troncons(trains, maj, jour, de, vers, apres)]
+    for x in gares_possibles:
+        if x in (de, vers):
+            continue
+        seconds = troncons(trains, maj, jour, x, vers, apres)
+        for t1 in troncons(trains, maj, jour, de, x, apres):
+            t2s = [t2 for t2 in seconds if t2["dep"] >= t1["arr"] + marge and t2["trip_id"] != t1["trip_id"]]
+            if t2s:
+                options.append([t1, min(t2s, key=lambda t: t["arr"])])
+    if not options:
+        return None
+    # arrivée la plus tôt, puis départ le plus tard (moins d'attente), puis moins de changements
+    return min(options, key=lambda o: (o[-1]["arr"], -o[0]["dep"].timestamp(), len(o)))
+
+
+def chercher_alternative(nom, resultats, plan, trains, maj, jour, now):
+    """Renvoie (texte, identifiant) si un trajet meilleur que le prévu existe, sinon (texte|None, None)."""
+    etapes = TRAJETS[nom]["etapes"]
+    if any(r["etat"] == "non_suivi" for r in resultats):
+        return None, None
+    marge = timedelta(minutes=MARGE_CORRESPONDANCE_MIN)
+
+    # où en est-on ? (gare où l'on se trouve et heure à partir de laquelle on peut repartir)
+    k, position, dispo = 0, etapes[0]["depart"], now
+    for i, r in enumerate(resultats):
+        parti = r["etat"] in ("ok", "retard") and r["depart_reel"] <= now
+        if not parti:
+            break
+        k = i + 1
+        position = etapes[i]["arrivee"]
+        dispo = max(now, r["arrivee_estimee"] + marge)
+    if k >= len(etapes):
+        return None, None
+    destination = etapes[-1]["arrivee"]
+
+    # arrivée prévue avec le trajet actuel (None s'il ne marche plus)
+    reste = resultats[k:]
+    casse = any(r["etat"] in ("supprime", "modifie") for r in reste)
+    for a, b in zip(reste, reste[1:]):
+        if a["etat"] in ("ok", "retard") and b["etat"] in ("ok", "retard") \
+                and a["arrivee_estimee"] + marge > b["depart_reel"]:
+            casse = True
+    if k > 0 and reste[0]["etat"] in ("ok", "retard") and reste[0]["depart_reel"] < dispo:
+        casse = True
+    arrivee_prevue = None if casse else reste[-1]["arrivee_estimee"]
+
+    gares_possibles = {e["depart"] for e in etapes} | {e["arrivee"] for e in etapes}
+    best = meilleur_trajet(trains, maj, jour, position, destination, dispo, gares_possibles)
+    actuels = {plan.get(f"{nom}:{i}", {}).get("trip_id") for i in range(k, len(etapes)) if plan.get(f"{nom}:{i}")}
+
+    if best is None:
+        return ("🚫 Aucune autre solution en train trouvée" if casse else None), None
+    if {t["trip_id"] for t in best} <= actuels:
+        return None, None
+    if arrivee_prevue and best[-1]["arr"] > arrivee_prevue - timedelta(minutes=GAIN_MIN_ALTERNATIVE):
+        return None, None
+
+    lignes = []
+    for i, t in enumerate(best):
+        retard = round((t["dep"] - t["dep_prevu"]).total_seconds() / 60)
+        r_txt = f" (+{retard} min)" if retard >= 1 else ""
+        verbe = "Prends" if i == 0 else "puis"
+        lignes.append(f"{verbe} le {hhmm(t['dep'])}{r_txt} {t['de']} → {t['vers']} (train {t['numero']})")
+    gain = ""
+    if arrivee_prevue:
+        gain = f", {round((arrivee_prevue - best[-1]['arr']).total_seconds() / 60)} min plus tôt"
+    titre = "💡 Plus rapide" if arrivee_prevue else "💡 Solution"
+    texte = f"{titre} : " + ", ".join(lignes) + f". Arrivée {hhmm(best[-1]['arr'])} à {destination}{gain}."
+    return texte, "+".join(t["trip_id"] for t in best)
+
+
 # ---------- message ----------
 def ligne(r):
     num = f" (train {r['numero']})" if r.get("numero") else ""
@@ -356,9 +500,9 @@ def correspondances(resultats):
     return out
 
 
-def signature(resultats, corresp):
+def signature(resultats, corresp, suggestion=None):
     return {"etapes": [{"etat": r["etat"], "retard": r["retard"]} for r in resultats],
-            "corresp": [c["menacee"] for c in corresp]}
+            "corresp": [c["menacee"] for c in corresp], "suggestion": suggestion}
 
 
 def changement_significatif(avant, apres):
@@ -366,6 +510,8 @@ def changement_significatif(avant, apres):
         avant = {"etapes": [{"etat": "ok", "retard": 0}] * len(apres["etapes"]),
                  "corresp": [False] * len(apres["corresp"])}
     if avant["corresp"] != apres["corresp"]:
+        return True
+    if apres.get("suggestion") and avant.get("suggestion") != apres.get("suggestion"):
         return True
     for a, b in zip(avant["etapes"], apres["etapes"]):
         ea = "ok" if a["etat"] == "non_suivi" else a["etat"]
@@ -412,7 +558,7 @@ def main():
         sauver_etat(state)
         return
 
-    plan = obtenir_plan(jour, state)
+    plan, trains = obtenir_plan(jour, state)
     maj, alertes = charger_temps_reel()
     print(f"Temps réel : {len(maj)} trains avec mise à jour, {len(alertes)} alertes")
 
@@ -422,6 +568,16 @@ def main():
                      for i, e in enumerate(etapes)]
         corresp = correspondances(resultats)
         texte = "\n".join([ligne(r) for r in resultats] + [c["texte"] for c in corresp if c["texte"]])
+        suggestion = None
+        probleme = any(r["etat"] in ("retard", "supprime", "modifie") for r in resultats) \
+            or any(c["menacee"] for c in corresp)
+        if ALTERNATIVES and probleme:
+            try:
+                txt_alt, suggestion = chercher_alternative(nom, resultats, plan, trains, maj, jour, now)
+                if txt_alt:
+                    texte += "\n" + txt_alt
+            except Exception as ex:
+                print("Recherche d'alternative impossible :", repr(ex))
         print(texte)
 
         # Prolongation de la surveillance si un train part plus tard que prévu
@@ -441,7 +597,7 @@ def main():
             continue
 
         cle = f"{jour.isoformat()}:{nom}"
-        sig = signature(resultats, corresp)
+        sig = signature(resultats, corresp, suggestion)
         if not changement_significatif(notifs.get(cle), sig):
             depart = heure(jour, etapes[0]["heure"])
             if (CONFIRMER_A_L_HEURE and cle not in notifs and cle + ":ok" not in notifs
@@ -452,7 +608,9 @@ def main():
                 print("Rien de nouveau depuis la dernière notification.")
             continue
 
-        if any(r["etat"] == "supprime" for r in resultats):
+        if suggestion:
+            quoi, prio = "change de train", 5
+        elif any(r["etat"] == "supprime" for r in resultats):
             quoi, prio = "train supprimé", 5
         elif any(r["etat"] == "modifie" for r in resultats):
             quoi, prio = "train modifié", 5
