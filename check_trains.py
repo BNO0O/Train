@@ -45,6 +45,8 @@ TRAJETS = {
 SURVEILLANCE_AVANT_MIN = 60   # on commence à surveiller 1 h avant le 1er train
 SEUIL_RETARD_MIN = 3          # en dessous, on considère le train à l'heure
 MARGE_CORRESPONDANCE_MIN = 2  # temps minimum pour changer de quai à Creil
+CONFIRMER_A_L_HEURE = True    # période d'essai : notifie aussi quand tout est à l'heure (False pour arrêter)
+CONFIRMATION_AVANT_MIN = 30   # … une fois par trajet, 30 min avant le départ
 # --------------------------------------------------------------------------
 
 GTFS_URL = "https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip"
@@ -407,7 +409,13 @@ def main():
         cle = f"{jour.isoformat()}:{nom}"
         sig = signature(resultats, corresp)
         if not changement_significatif(notifs.get(cle), sig):
-            print("Rien de nouveau depuis la dernière notification.")
+            depart = heure(jour, etapes[0]["heure"])
+            if (CONFIRMER_A_L_HEURE and cle not in notifs and cle + ":ok" not in notifs
+                    and now >= depart - timedelta(minutes=CONFIRMATION_AVANT_MIN)):
+                notifier(f"🚆 {nom} : tout est à l'heure", texte, 2, ["white_check_mark", "train"])
+                notifs[cle + ":ok"] = True
+            else:
+                print("Rien de nouveau depuis la dernière notification.")
             continue
 
         if any(r["etat"] == "supprime" for r in resultats):
