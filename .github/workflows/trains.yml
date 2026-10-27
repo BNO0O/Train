@@ -12,6 +12,10 @@ on:
         description: "Envoyer une notification de test"
         type: boolean
         default: true
+      departs:
+        description: "Tableau des départs (ex. Compiègne>Creil,Orry-la-Ville) — laisser vide sinon"
+        type: string
+        default: ""
 
 concurrency:
   group: trains
@@ -43,6 +47,7 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test && '1' || '' }}
+          DEPARTS: ${{ inputs.departs }}
 
       - name: Sauver la mémoire des notifications
         if: always() && hashFiles('state.json') != ''

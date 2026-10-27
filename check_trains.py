@@ -532,6 +532,49 @@ def notifier(titre, texte, priorite, tags):
     print("Notification envoyée :", titre)
 
 
+# ---------- tableau des départs (à la demande) ----------
+def tableau_departs(spec, now):
+    """spec = "Compiègne>Creil,Orry-la-Ville" : départs du jour de la 1re gare desservant les suivantes."""
+    from google.transit import gtfs_realtime_pb2
+    CANCELED = gtfs_realtime_pb2.TripDescriptor.CANCELED
+    de, vers = spec.split(">", 1)
+    vers = [v.strip() for v in vers.split(",") if v.strip()]
+    jour = now.date()
+    state = charger_etat()
+    _, trains = obtenir_plan(jour, state)
+    sauver_etat(state)
+    maj, _ = charger_temps_reel()
+    lignes = []
+    for trip_id, t in trains.items():
+        a = t["arrets"]
+        io_ = next((i for i, x in enumerate(a) if x[2] == de.strip()), None)
+        if io_ is None:
+            continue
+        suite = [x for x in a[io_ + 1:] if x[2] in vers]
+        if not suite:
+            continue
+        tu = maj.get(trip_id)
+        prevu = gtfs_heure(jour, a[io_][4])
+        if tu is not None and tu.trip.schedule_relationship == CANCELED:
+            etat, reel = "❌ supprimé", None
+        else:
+            reel = temps_reel_arret(tu, a[io_], jour, "dep")
+            if reel is None:
+                etat = "❌ ne s'arrête pas"
+            else:
+                r = round((reel - prevu).total_seconds() / 60)
+                etat = f"⚠️ +{r} min" if r >= 1 else "✅ à l'heure"
+        arrivees = []
+        for x in suite:
+            h = temps_reel_arret(tu, x, jour, "arr") if etat.startswith(("✅", "⚠️")) else None
+            arrivees.append(f"{x[2]} {hhmm(h or gtfs_heure(jour, x[3]))}")
+        lignes.append((prevu, f"{hhmm(prevu)} train {t['numero']} — {etat} — arrivée " + ", ".join(arrivees)))
+    lignes.sort()
+    print(f"Départs de {de} vers {', '.join(vers)} (aujourd'hui, {len(lignes)} trains) :")
+    for _, l in lignes:
+        print(l)
+
+
 # ---------- programme principal ----------
 def main():
     now = datetime.now(TZ)
@@ -636,7 +679,10 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if os.environ.get("DEPARTS"):
+            tableau_departs(os.environ["DEPARTS"], datetime.now(TZ))
+        else:
+            main()
     except Exception as e:
         print("Erreur :", repr(e), file=sys.stderr)
         publier_journal()
