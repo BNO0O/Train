@@ -44,6 +44,8 @@ TRAJETS = {
 
 SURVEILLANCE_AVANT_MIN = 60   # on commence à surveiller 1 h avant le 1er train
 SEUIL_RETARD_MIN = 3          # en dessous, on considère le train à l'heure
+SEUIL_CHANGEMENT_MIN = 1      # nouvelle alerte dès que l'heure de départ bouge d'au moins 1 min
+PROLONGATION_MAX_MIN = 120    # si retard, on surveille jusqu'au départ réel (au plus 2 h de plus)
 MARGE_CORRESPONDANCE_MIN = 2  # temps minimum pour changer de quai à Creil
 CONFIRMER_A_L_HEURE = True    # période d'essai : notifie aussi quand tout est à l'heure (False pour arrêter)
 CONFIRMATION_AVANT_MIN = 30   # … une fois par trajet, 30 min avant le départ
@@ -370,7 +372,7 @@ def changement_significatif(avant, apres):
         eb = "ok" if b["etat"] == "non_suivi" else b["etat"]
         if ea != eb:
             return True
-        if eb == "retard" and abs(a["retard"] - b["retard"]) >= SEUIL_RETARD_MIN:
+        if eb == "retard" and abs(a["retard"] - b["retard"]) >= SEUIL_CHANGEMENT_MIN:
             return True
     return False
 
@@ -398,6 +400,10 @@ def main():
         etapes = trajet["etapes"]
         debut = heure(jour, etapes[0]["heure"]) - timedelta(minutes=SURVEILLANCE_AVANT_MIN)
         fin = heure(jour, etapes[-1]["heure"]) + timedelta(minutes=2)
+        prolong = state.get("prolongation", {}).get(f"{jour.isoformat()}:{nom}")
+        if prolong:  # train en retard : on surveille jusqu'à son départ réel
+            fin = max(fin, min(datetime.fromisoformat(prolong),
+                               fin + timedelta(minutes=PROLONGATION_MAX_MIN)))
         if TEST or (now.weekday() in trajet["jours"] and debut <= now <= fin):
             a_surveiller.append(nom)
         else:
@@ -417,6 +423,18 @@ def main():
         corresp = correspondances(resultats)
         texte = "\n".join([ligne(r) for r in resultats] + [c["texte"] for c in corresp if c["texte"]])
         print(texte)
+
+        # Prolongation de la surveillance si un train part plus tard que prévu
+        prolongations = state.setdefault("prolongation", {})
+        for k in [k for k in prolongations if not k.startswith(jour.isoformat())]:
+            del prolongations[k]
+        departs = [r["depart_reel"] + timedelta(minutes=2) for r in resultats
+                   if r["etat"] in ("retard", "ok") and r.get("depart_reel")]
+        cle_p = f"{jour.isoformat()}:{nom}"
+        if any(r["etat"] == "retard" for r in resultats) and departs:
+            prolongations[cle_p] = max(departs).isoformat()
+        else:
+            prolongations.pop(cle_p, None)
 
         if TEST:
             notifier(f"🧪 Test – {nom}", texte, 3, ["train"])
@@ -447,6 +465,10 @@ def main():
 
         if quoi:
             notifier(f"🚆 {nom} : {quoi}", texte, prio, ["warning", "train"])
+        elif now >= heure(jour, etapes[-1]["heure"]):
+            # le train vient sans doute de partir (il disparaît du temps réel) : pas de faux « retour à la normale »
+            print("Train parti, pas de notification.")
+            continue
         else:
             notifier(f"🚆 {nom} : retour à la normale", texte, prio, ["white_check_mark", "train"])
         notifs[cle] = sig
