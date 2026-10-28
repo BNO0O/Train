@@ -541,6 +541,39 @@ def notifier(titre, texte, priorite, tags):
     print("Notification envoyée :", titre)
 
 
+# ---------- mode boucle : une seule exécution surveille tout le créneau ----------
+def fenetre_active_ou_proche(now, marge_min=15):
+    jour = now.date()
+    state = charger_etat()
+    for nom, trajet in TRAJETS.items():
+        if now.weekday() not in trajet["jours"]:
+            continue
+        etapes = trajet["etapes"]
+        debut = heure(jour, etapes[0]["heure"]) - timedelta(minutes=SURVEILLANCE_AVANT_MIN)
+        fin = heure(jour, etapes[-1]["heure"]) + timedelta(minutes=2)
+        prolong = state.get("prolongation", {}).get(f"{jour.isoformat()}:{nom}")
+        if prolong:
+            fin = max(fin, min(datetime.fromisoformat(prolong), fin + timedelta(minutes=PROLONGATION_MAX_MIN)))
+        if debut - timedelta(minutes=marge_min) <= now <= fin:
+            return True
+    return False
+
+
+def boucle(intervalle_s=120, duree_max_min=170):
+    import time as _t
+    t0 = _t.time()
+    while _t.time() - t0 < duree_max_min * 60:
+        now = datetime.now(TZ)
+        if not fenetre_active_ou_proche(now):
+            print("Plus de trajet à surveiller : fin de la boucle.")
+            return
+        try:
+            main()
+        except Exception as e:
+            print("Erreur (on continue) :", repr(e))
+        _t.sleep(intervalle_s)
+
+
 # ---------- tableau des départs (à la demande) ----------
 def tableau_departs(spec, now):
     """spec = "Compiègne>Creil,Orry-la-Ville" : départs du jour de la 1re gare desservant les suivantes."""
@@ -692,6 +725,8 @@ if __name__ == "__main__":
     try:
         if os.environ.get("DEPARTS"):
             tableau_departs(os.environ["DEPARTS"], datetime.now(TZ))
+        elif os.environ.get("BOUCLE") == "1":
+            boucle()
         else:
             main()
     except Exception as e:

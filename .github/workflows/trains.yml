@@ -6,12 +6,18 @@ on:
     # Couvre l'heure d'hiver et d'été ; le script filtre lui-même la bonne fenêtre.
     - cron: "*/5 4-7 * * 1-5"    # aller (7h40)
     - cron: "*/5 14-16 * * 1-5"  # retour (17h11)
+  repository_dispatch:
+    types: [surveiller]
   workflow_dispatch:
     inputs:
       test:
         description: "Envoyer une notification de test"
         type: boolean
         default: true
+      boucle:
+        description: "Surveiller en continu tout le créneau en cours (toutes les 2 min)"
+        type: boolean
+        default: false
       departs:
         description: "Tableau des départs (ex. Compiègne>Creil,Orry-la-Ville) — laisser vide sinon"
         type: string
@@ -24,7 +30,7 @@ concurrency:
 jobs:
   verifier:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: ${{ (github.event_name == 'repository_dispatch' || inputs.boucle) && 180 || 10 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +54,7 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test && '1' || '' }}
           DEPARTS: ${{ inputs.departs }}
+          BOUCLE: ${{ (github.event_name == 'repository_dispatch' || inputs.boucle) && '1' || '' }}
 
       - name: Sauver la mémoire des notifications
         if: always() && hashFiles('state.json') != ''
