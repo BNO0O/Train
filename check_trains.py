@@ -653,6 +653,16 @@ def main():
         etapes = TRAJETS[nom]["etapes"]
         resultats = [analyser_etape(e, plan.get(f"{nom}:{i}"), jour, maj, alertes)
                      for i, e in enumerate(etapes)]
+        # Un train déjà parti disparaît du temps réel : on garde son dernier état connu
+        avant = notifs.get(f"{jour.isoformat()}:{nom}")
+        if avant:
+            for i, r in enumerate(resultats):
+                prec = avant["etapes"][i] if i < len(avant["etapes"]) else None
+                if (prec and prec["etat"] == "retard" and r["etat"] == "ok" and r.get("depart_reel")
+                        and now >= r["depart_reel"]):
+                    d = timedelta(minutes=prec["retard"])
+                    r.update(etat="retard", retard=prec["retard"], depart_reel=r["depart_reel"] + d,
+                             arrivee_estimee=r["arrivee_estimee"] + d)
         corresp = correspondances(resultats)
         texte = "\n".join([ligne(r) for r in resultats] + [c["texte"] for c in corresp if c["texte"]])
         suggestion = None
