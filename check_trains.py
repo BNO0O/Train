@@ -579,13 +579,18 @@ def tableau_departs(spec, now):
     """spec = "Compiègne>Creil,Orry-la-Ville" : départs du jour de la 1re gare desservant les suivantes."""
     from google.transit import gtfs_realtime_pb2
     CANCELED = gtfs_realtime_pb2.TripDescriptor.CANCELED
+    if ";" in spec:  # plusieurs tableaux d'un coup
+        for sp in spec.split(";"):
+            if sp.strip():
+                tableau_departs(sp.strip(), now)
+        return
     de, vers = spec.split(">", 1)
     vers = [v.strip() for v in vers.split(",") if v.strip()]
-    jour = now.date()
+    jour = date.fromisoformat(os.environ["JOUR"]) if os.environ.get("JOUR") else now.date()
     state = charger_etat()
     _, trains = obtenir_plan(jour, state)
     sauver_etat(state)
-    maj, _ = charger_temps_reel()
+    maj, _ = charger_temps_reel() if jour == now.date() else ({}, {})
     lignes = []
     for trip_id, t in trains.items():
         a = t["arrets"]
@@ -614,7 +619,7 @@ def tableau_departs(spec, now):
         lignes.append((prevu, f"{hhmm(prevu)} train {t['numero']} → terminus {term} — {etat} — passe à "
                        + ", ".join(arrivees)))
     lignes.sort()
-    print(f"Départs de {de} vers {', '.join(vers)} (aujourd'hui, {len(lignes)} trains) :")
+    print(f"Départs de {de} vers {', '.join(vers)} (le {jour.strftime('%d/%m')}, {len(lignes)} trains) :")
     for _, l in lignes:
         print(l)
 

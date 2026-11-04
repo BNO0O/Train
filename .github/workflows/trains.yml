@@ -22,6 +22,10 @@ on:
         description: "Tableau des départs (ex. Compiègne>Creil,Orry-la-Ville) — laisser vide sinon"
         type: string
         default: ""
+      jour:
+        description: "Date du tableau (AAAA-MM-JJ), vide = aujourd'hui"
+        type: string
+        default: ""
 
 concurrency:
   group: trains
@@ -54,6 +58,7 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test && '1' || '' }}
           DEPARTS: ${{ inputs.departs }}
+          JOUR: ${{ inputs.jour }}
           BOUCLE: ${{ (github.event_name == 'repository_dispatch' || inputs.boucle) && '1' || '' }}
 
       - name: Sauver la mémoire des notifications
