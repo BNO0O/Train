@@ -300,8 +300,9 @@ def analyser_etape(e, info, jour, maj, alertes):
 
     r = {"libelle": f"{e['heure']} {e['depart']} → {e['arrivee']}", "gare_arrivee": e["arrivee"],
          "retard": 0, "message": ""}
-    if not info:
-        r["etat"] = "non_suivi"
+    if not info:  # absent des horaires SNCF du jour : supprimé (grève, travaux…)
+        r["etat"] = "supprime"
+        r["message"] = "absent des horaires SNCF du jour (grève, travaux ?)"
         return r
 
     r["numero"] = info["numero"]
