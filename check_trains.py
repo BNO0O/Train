@@ -590,7 +590,8 @@ def tableau_departs(spec, now):
     jour = date.fromisoformat(os.environ["JOUR"]) if os.environ.get("JOUR") else now.date()
     state = charger_etat()
     _, trains = obtenir_plan(jour, state)
-    sauver_etat(state)
+    if jour == now.date():  # ne pas figer à l'avance les horaires d'un autre jour
+        sauver_etat(state)
     maj, _ = charger_temps_reel() if jour == now.date() else ({}, {})
     lignes = []
     for trip_id, t in trains.items():
