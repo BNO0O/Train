@@ -307,9 +307,8 @@ def analyser_etape(e, info, jour, maj, alertes):
 
     r = {"libelle": f"{e['heure']} {e['depart']} → {e['arrivee']}", "gare_arrivee": e["arrivee"],
          "retard": 0, "message": ""}
-    if not info:  # absent des horaires SNCF du jour : supprimé (grève, travaux…)
-        r["etat"] = "supprime"
-        r["message"] = "absent des horaires SNCF du jour (grève, travaux ?)"
+    if not info:  # absent des horaires du jour, sans suppression confirmée en temps réel
+        r["etat"] = "introuvable"
         return r
 
     r["numero"] = info["numero"]
@@ -454,7 +453,8 @@ def chercher_alternative(nom, resultats, plan, trains, maj, jour, now):
 
     # arrivée prévue avec le trajet actuel (None s'il ne marche plus)
     reste = resultats[k:]
-    casse = any(r["etat"] in ("supprime", "modifie") for r in reste)
+    casse = any(r["etat"] in ("supprime", "modifie", "introuvable") for r in reste)
+    incertain = any(r["etat"] == "introuvable" for r in reste)
     for a, b in zip(reste, reste[1:]):
         if a["etat"] in ("ok", "retard") and b["etat"] in ("ok", "retard") \
                 and a["arrivee_estimee"] + marge > b["depart_reel"]:
@@ -483,7 +483,7 @@ def chercher_alternative(nom, resultats, plan, trains, maj, jour, now):
     gain = ""
     if arrivee_prevue:
         gain = f", {round((arrivee_prevue - best[-1]['arr']).total_seconds() / 60)} min plus tôt"
-    titre = "💡 Plus rapide" if arrivee_prevue else "💡 Solution"
+    titre = "💡 Plus rapide" if arrivee_prevue else ("💡 S'il est bien supprimé" if incertain else "💡 Solution")
     texte = f"{titre} : " + ", ".join(lignes) + f". Arrivée {hhmm(best[-1]['arr'])} à {destination}{gain}."
     return texte, "+".join(t["trip_id"] for t in best)
 
@@ -500,6 +500,9 @@ def ligne(r):
         txt = f"❌ {r['libelle']} : SUPPRIMÉ{num}"
     elif e == "modifie":
         txt = f"⚠️ {r['libelle']} : ne s'arrête plus à {r['gare_arrivee']}{num}"
+    elif e == "introuvable":
+        return (f"⚠️ {r['libelle']} : train introuvable dans les horaires du jour, "
+                "vérifie sur SNCF Connect avant de changer tes plans")
     else:
         return f"❓ {r['libelle']} : absent des données SNCF du jour (non surveillé)"
     if r["message"] and e != "ok":
@@ -682,7 +685,7 @@ def main():
         corresp = correspondances(resultats)
         texte = "\n".join([ligne(r) for r in resultats] + [c["texte"] for c in corresp if c["texte"]])
         suggestion = None
-        probleme = any(r["etat"] in ("retard", "supprime", "modifie") for r in resultats) \
+        probleme = any(r["etat"] in ("retard", "supprime", "modifie", "introuvable") for r in resultats) \
             or any(c["menacee"] for c in corresp)
         if ALTERNATIVES and probleme:
             try:
@@ -721,7 +724,10 @@ def main():
                 print("Rien de nouveau depuis la dernière notification.")
             continue
 
-        if suggestion:
+        if any(r["etat"] == "introuvable" for r in resultats) and \
+                not any(r["etat"] in ("supprime", "modifie") for r in resultats):
+            quoi, prio = "train introuvable, à vérifier", 4
+        elif suggestion:
             quoi, prio = "change de train", 5
         elif any(r["etat"] == "supprime" for r in resultats):
             quoi, prio = "train supprimé", 5
