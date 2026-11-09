@@ -30,14 +30,14 @@ TRAJETS = {
     "Aller": {
         "jours": [0, 1, 2, 3, 4],  # 0 = lundi ... 4 = vendredi
         "etapes": [
-            {"depart": "Orry-la-Ville", "arrivee": "Creil", "heure": "07:40"},
-            {"depart": "Creil", "arrivee": "Compiègne", "heure": "08:04"},
+            {"depart": "Orry-la-Ville", "arrivee": "Creil", "heure": "07:40", "train": "847603"},
+            {"depart": "Creil", "arrivee": "Compiègne", "heure": "08:04", "train": "847905"},
         ],
     },
     "Retour": {
         "jours": [0, 1, 2, 3, 4],
         "etapes": [
-            {"depart": "Compiègne", "arrivee": "Orry-la-Ville", "heure": "17:11"},
+            {"depart": "Compiègne", "arrivee": "Orry-la-Ville", "heure": "17:11", "train": "847876"},
         ],
     },
 }
@@ -48,6 +48,7 @@ SEUIL_CHANGEMENT_MIN = 1      # nouvelle alerte dès que l'heure de départ boug
 ALTERNATIVES = True           # en cas de problème, cherche un trajet plus rapide
 GAIN_MIN_ALTERNATIVE = 3      # … proposé seulement s'il fait arriver au moins 3 min plus tôt
 PROLONGATION_MAX_MIN = 120    # si retard, on surveille jusqu'au départ réel (au plus 2 h de plus)
+TOLERANCE_HORAIRE_MIN = 10    # on retrouve son train même si l'horaire officiel bouge de quelques minutes
 MARGE_CORRESPONDANCE_MIN = 2  # temps minimum pour changer de quai à Creil
 CONFIRMER_A_L_HEURE = True    # période d'essai : notifie aussi quand tout est à l'heure (False pour arrêter)
 CONFIRMATION_AVANT_MIN = 30   # … une fois par trajet, 30 min avant le départ
@@ -191,14 +192,23 @@ def construire_plan(jour, zip_bytes):
         for i, e in enumerate(trajet["etapes"]):
             cle = f"{nom}:{i}"
             o_ids, d_ids = gares[e["depart"]], gares[e["arrivee"]]
-            trouve = None
+            trouve, meilleur_ecart = None, None
+            h_cfg = int(e["heure"][:2]) * 60 + int(e["heure"][3:5])
             for trip_id, ps in passages.items():
                 ps.sort()
                 for po in ps:
-                    if po[1] in o_ids and po[3][:5].zfill(5) == e["heure"].zfill(5):
+                    if po[1] not in o_ids:
+                        continue
+                    # même train même si la SNCF décale l'horaire de quelques minutes (ex. 7h39 au lieu de 7h40)
+                    ecart = abs(int(po[3][:2]) * 60 + int(po[3][3:5]) - h_cfg)
+                    numero = trips[trip_id].get("trip_headsign") or trips[trip_id].get("trip_short_name") or ""
+                    if e.get("train") and numero != e["train"]:
+                        continue  # numéro de train connu : on ne prend que celui-là (sinon = supprimé)
+                    if ecart <= (60 if e.get("train") else TOLERANCE_HORAIRE_MIN) and (meilleur_ecart is None or ecart < meilleur_ecart):
                         pd = next((p for p in ps if p[0] > po[0] and p[1] in d_ids), None)
                         if pd:
                             t = trips[trip_id]
+                            meilleur_ecart = ecart
                             trouve = {
                                 "trip_id": trip_id,
                                 "numero": t.get("trip_headsign") or t.get("trip_short_name") or "",
@@ -206,9 +216,6 @@ def construire_plan(jour, zip_bytes):
                                 "arrivee_stop": pd[1], "arrivee_seq": pd[0], "arrivee": pd[2],
                                 "gare_depart": court(o_ids[po[1]]), "gare_arrivee": court(d_ids[pd[1]]),
                             }
-                            break
-                if trouve:
-                    break
             plan[cle] = trouve
             print(f"{nom} {e['heure']} {e['depart']} → {e['arrivee']} : "
                   + (f"train {trouve['numero']} ({trouve['trip_id']})" if trouve else "NON TROUVÉ"))
@@ -306,6 +313,8 @@ def analyser_etape(e, info, jour, maj, alertes):
         return r
 
     r["numero"] = info["numero"]
+    if info["depart"][:5] != e["heure"].zfill(5):
+        r["libelle"] = f"{info['depart'][:5]} {e['depart']} → {e['arrivee']} (au lieu de {e['heure']})"
     r["gare_arrivee"] = info["gare_arrivee"]
     dep_prevu = gtfs_heure(jour, info["depart"])
     arr_prevue = gtfs_heure(jour, info["arrivee"])
